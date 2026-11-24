@@ -39,11 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.2',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.3',layout='wide')
     if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.2 — Historical backtest')
+    st.title('Football Intelligence V3.3 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -84,7 +84,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.2')
+    st.title('Market research — V3.3')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -238,6 +238,61 @@ def unified_search():
             else:
                 gap=abs(x-y)*100; st.metric('Midpoint difference',f'{gap:.1f} percentage points'); st.write('Polymarket: '+fmt(x)+' | Kalshi: '+fmt(y))
                 if gap>=5: st.warning('Large discrepancy: investigate quote freshness, match state and settlement rules. Not an arbitrage or betting signal.')
-    st.caption('Concurrent requests do not guarantee synchronized exchange quotes. Retrieval time is not quote time. Discovery is bounded and may miss fixtures. No live score feed, trade history or bookmaker coverage yet.')
+    st.caption('Concurrent requests do not guarantee synchronized exchange quotes. Retrieval time is not quote time. Discovery is bounded and may miss fixtures. No live score feed or bookmaker coverage yet.')
+    trade_research(snapshots, ids)
+
+def trade_research(snapshots, ids):
+    import requests
+    from datetime import datetime, timezone
+    st.subheader('Public trade history — research')
+    st.caption('Bounded recent trade sample. No inference of trader skill or net positions. Trade timestamps are provider supplied.')
+    options={}
+    for provider,(_,markets,_) in snapshots.items():
+        for m in markets:
+            ident=m.get('conditionId') if provider=='Polymarket' else m.get('ticker')
+            if ident: options[(provider,ident)]=str(m.get('question') or m.get('title') or ident)
+    if not options: return
+    selected=st.selectbox('Trade market',list(options),format_func=lambda k:k[0]+' — '+options[k])
+    def number(v):
+        try:
+            x=float(v); return x if math.isfinite(x) else None
+        except (ValueError,TypeError): return None
+    if st.button('Load recent public trades'):
+        provider,ident=selected; rows=[]; error=None
+        try:
+            if provider=='Polymarket':
+                r=requests.get('https://data-api.polymarket.com/trades',params={'market':ident,'limit':500,'takerOnly':'true'},timeout=20); r.raise_for_status(); trades=r.json()
+            else:
+                r=requests.get('https://api.elections.kalshi.com/trade-api/v2/markets/trades',params={'ticker':ident,'limit':500},timeout=20); r.raise_for_status(); trades=r.json().get('trades',[])
+            for t in trades:
+                if provider=='Polymarket':
+                    price=number(t.get('price')); size=number(t.get('size')); side=t.get('side'); outcome=t.get('outcome'); ts=pd.to_datetime(t.get('timestamp'),unit='s',utc=True,errors='coerce'); yes=price if str(outcome).lower()=='yes' else 1-price if price is not None and str(outcome).lower()=='no' else None
+                else:
+                    yes=number(t.get('yes_price_dollars')); old=number(t.get('yes_price'))
+                    if yes is None and old is not None: yes=old/100
+                    size=number(t.get('count_fp',t.get('count'))); side=t.get('taker_side'); outcome=side; ts=pd.to_datetime(t.get('created_time'),utc=True,errors='coerce'); price=yes if side=='yes' else 1-yes if side=='no' and yes is not None else None
+                notional=price*size if price is not None and size is not None and 0<=price<=1 and size>=0 else None
+                rows.append(dict(provider=provider,market_id=ident,timestamp_utc=ts,outcome=outcome,reported_side=side,price=price,yes_price=yes,contracts=size,estimated_trade_value_usd=notional,trade_id=t.get('trade_id',t.get('transactionHash'))))
+        except Exception as exc: error=str(exc)
+        st.session_state['trades33']=(selected,rows,error,datetime.now(timezone.utc).isoformat())
+    saved=st.session_state.get('trades33')
+    if not saved or saved[0]!=selected: return
+    _,rows,error,retrieved=saved
+    if error: st.error(error); return
+    if not rows: st.info('No public trades returned.'); return
+    df=pd.DataFrame(rows).sort_values('timestamp_utc'); st.caption('Retrieved UTC: '+retrieved+' | Returned trades: '+str(len(df))+' (maximum 500; not complete history)')
+    st.dataframe(df,hide_index=True)
+    st.download_button('Download trade CSV',df.to_csv(index=False),'public_trades.csv','text/csv')
+    valid=df.dropna(subset=['timestamp_utc','yes_price'])
+    if not valid.empty: st.line_chart(valid.set_index('timestamp_utc')['yes_price'])
+    st.caption('Estimated trade value is contracts × reported side price, not net money flow or account exposure. No trader identities or skill rankings are inferred.')
+    goal=st.text_input('Optional match event time (UTC ISO format, e.g. 2026-11-24T02:00:00Z)')
+    if goal:
+        g=pd.to_datetime(goal,utc=True,errors='coerce')
+        if pd.isna(g): st.warning('Enter a valid UTC timestamp.')
+        else:
+            before=valid[(valid.timestamp_utc<g)&(valid.timestamp_utc>=g-pd.Timedelta(minutes=5))]; after=valid[(valid.timestamp_utc>=g)&(valid.timestamp_utc<=g+pd.Timedelta(minutes=5))]
+            st.write('Five-minute windows around supplied event time (descriptive only)')
+            st.dataframe(pd.DataFrame([{'window':n,'trades':len(d),'mean_yes_trade_price':d.yes_price.mean()} for n,d in [('Before',before),('After',after)]]),hide_index=True)
 
 if __name__=='__main__': main()
