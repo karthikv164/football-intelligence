@@ -39,11 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.1',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.2',layout='wide')
     if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.1 — Historical backtest')
+    st.title('Football Intelligence V3.2 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -84,7 +84,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.1')
+    st.title('Market research — V3.2')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -96,7 +96,10 @@ def market_research():
     def pct(v):
         try: return f'{float(v):.1%}'
         except (ValueError,TypeError): return 'Unavailable'
-    source=st.radio('Provider',['Polymarket','Kalshi'],horizontal=True)
+    source=st.radio('Provider',['Unified search','Polymarket','Kalshi'],horizontal=True)
+    if source=='Unified search':
+        unified_search()
+        return
     if source=='Polymarket':
         raw=st.text_input('Event URL or exact slug').strip()
         slug=urlparse(raw).path.rstrip('/').split('/')[-1] if '://' in raw else raw
@@ -138,5 +141,103 @@ def market_research():
                         st.write(key.replace('_',' ').title()+': '+pct(v))
                     st.write('Reported volume (contracts):',m.get('volume_fp',m.get('volume','Unavailable')))
     st.info('Provider snapshots only. Automatic discovery, trade history, cross-provider matching, additional bookmakers and lineup feeds are not yet implemented.')
+
+def unified_search():
+    import requests, re, json
+    from datetime import datetime, timezone
+    from concurrent.futures import ThreadPoolExecutor
+    from difflib import SequenceMatcher
+    P='https://gamma-api.polymarket.com'
+    K='https://api.elections.kalshi.com/trade-api/v2'
+    def get(url,params):
+        r=requests.get(url,params=params,timeout=15); r.raise_for_status(); return r.json()
+    def stamp(): return datetime.now(timezone.utc).isoformat()
+    def norm(s): return ' '.join(re.findall(r'[a-z0-9]+',str(s).lower()))
+    def score(title,query):
+        t=norm(title); q=norm(query); words=q.split()
+        return sum(w in t.split() for w in words)/max(1,len(words)) + .2*SequenceMatcher(None,t,q).ratio()
+    def poly_search(q):
+        d=get(P+'/public-search',{'q':q,'limit_per_type':30}); return d.get('events',[])
+    def kalshi_search(q):
+        # Public events listing is paginated; search a bounded sample, not all events.
+        rows=[]; cursor=None
+        for _ in range(8):
+            params={'limit':200,'status':'open','series_ticker':series}
+            if cursor: params['cursor']=cursor
+            d=get(K+'/events',params); rows.extend(d.get('events',[])); cursor=d.get('cursor')
+            if not cursor: break
+        return rows
+    q=st.text_input('Match or team name',placeholder='St Louis vs Los Angeles')
+    series=st.text_input('Kalshi football series ticker',value='KXMLSGAME',help='Change for other leagues. Discovery scans up to 1,600 open events in this series.') .strip().upper()
+    if st.button('Find matches',type='primary') and q.strip():
+        results={}; errors={}
+        with st.spinner('Searching both providers…'), ThreadPoolExecutor(max_workers=2) as pool:
+            jobs={'Polymarket':pool.submit(poly_search,q),'Kalshi':pool.submit(kalshi_search,q)}
+            for name,f in jobs.items():
+                try: results[name]=sorted(f.result(),key=lambda e:score(e.get('title',''),q),reverse=True)[:15]
+                except Exception as exc: errors[name]=str(exc); results[name]=[]
+        st.session_state['discovery32']=(q,series,results,errors)
+        st.session_state.pop('comparison32',None)
+    if 'discovery32' not in st.session_state: return
+    oldq,olds,results,errors=st.session_state['discovery32']
+    st.caption('Search results for '+oldq+' / '+olds+'. Select the same fixture manually; names alone do not verify settlement rules.')
+    selected={}
+    for name,key in [('Polymarket','slug'),('Kalshi','event_ticker')]:
+        if name in errors: st.warning(name+': '+errors[name])
+        options={e[key]:e for e in results.get(name,[]) if e.get(key)}
+        selected[name]=st.selectbox(name+' event',[None]+list(options),format_func=lambda x: 'Select event' if x is None else str(options[x].get('title',''))+' | '+x,key='select32'+name)
+    confirmed=st.checkbox('I checked that both events refer to the same fixture and regulation-time settlement rules.')
+    if st.button('Retrieve both snapshots',disabled=not all(selected.values())):
+        def load(name,ident):
+            if name=='Polymarket':
+                d=get(P+'/events',{'slug':ident}); e=next(x for x in d if x.get('slug')==ident); return e,e.get('markets',[]),stamp()
+            d=get(K+'/events/'+requests.utils.quote(ident,safe=''),{'with_nested_markets':'true'}); e=d.get('event',{}); return e,e.get('markets') or d.get('markets') or [],stamp()
+        snapshots={}; errors={}
+        with st.spinner('Retrieving provider snapshots…'), ThreadPoolExecutor(max_workers=2) as pool:
+            jobs={n:pool.submit(load,n,i) for n,i in selected.items()}
+            for n,f in jobs.items():
+                try: snapshots[n]=f.result()
+                except Exception as exc: errors[n]=str(exc)
+        st.session_state['comparison32']=(dict(selected),snapshots,errors)
+    if 'comparison32' not in st.session_state: return
+    ids,snapshots,errors=st.session_state['comparison32']
+    if ids!=selected: st.info('Selection changed. Retrieve fresh snapshots.'); return
+    def num(x):
+        try:
+            v=float(x); return v if math.isfinite(v) and 0<=v<=1 else None
+        except (TypeError,ValueError): return None
+    def kp(m,k):
+        v=m.get(k+'_dollars'); old=m.get(k)
+        return num(v if v is not None else float(old)/100 if old is not None else None)
+    def arr(x):
+        try: return json.loads(x) if isinstance(x,str) else x or []
+        except ValueError: return []
+    def fmt(v): return 'Unavailable' if v is None else f'{v:.1%}'
+    quotes={}
+    for n,err in errors.items(): st.error(n+': '+err)
+    for n,(e,markets,ts) in snapshots.items():
+        st.subheader(n+' — '+str(e.get('title',''))); st.caption('Retrieved UTC: '+ts)
+        quotes[n]={}
+        for i,m in enumerate(markets):
+            title=str(m.get('question') or m.get('title') or 'Market'); label=f'{i+1}. {title}'
+            if n=='Polymarket':
+                bid=num(m.get('bestBid')); ask=num(m.get('bestAsk')); outcomes=arr(m.get('outcomes')); prices=arr(m.get('outcomePrices')); reported=next((num(prices[j]) for j,o in enumerate(outcomes) if str(o).lower()=='yes' and j<len(prices)),None); active=not m.get('closed') and m.get('active') is True and m.get('acceptingOrders') is True
+            else:
+                bid=kp(m,'yes_bid'); ask=kp(m,'yes_ask'); reported=kp(m,'last_price'); active=m.get('status')=='active'
+            mid=(bid+ask)/2 if active and bid is not None and ask is not None and 0<bid<=ask<1 else None
+            quotes[n][label]=mid
+            with st.container(border=True):
+                st.write(title); st.write('YES bid / ask: '+fmt(bid)+' / '+fmt(ask)); st.write('Reported YES / last: '+fmt(reported)); st.write('Active quote midpoint: '+fmt(mid)); st.caption('Reported volume ('+('contracts' if n=='Kalshi' else 'provider units')+'): '+str(m.get('volume_fp',m.get('volume','Unavailable'))))
+    if len(quotes)==2 and all(quotes.values()):
+        st.subheader('Compare equivalent markets')
+        a=st.selectbox('Polymarket outcome',[None]+list(quotes['Polymarket']),format_func=lambda x:x or 'Choose outcome'); b=st.selectbox('Kalshi outcome',[None]+list(quotes['Kalshi']),format_func=lambda x:x or 'Choose outcome')
+        same=st.checkbox('These two outcomes have equivalent definitions and settlement rules.')
+        if confirmed and same and a and b:
+            x=quotes['Polymarket'][a]; y=quotes['Kalshi'][b]
+            if x is None or y is None: st.warning('Comparable active bid/ask quotes unavailable.')
+            else:
+                gap=abs(x-y)*100; st.metric('Midpoint difference',f'{gap:.1f} percentage points'); st.write('Polymarket: '+fmt(x)+' | Kalshi: '+fmt(y))
+                if gap>=5: st.warning('Large discrepancy: investigate quote freshness, match state and settlement rules. Not an arbitrage or betting signal.')
+    st.caption('Concurrent requests do not guarantee synchronized exchange quotes. Retrieval time is not quote time. Discovery is bounded and may miss fixtures. No live score feed, trade history or bookmaker coverage yet.')
 
 if __name__=='__main__': main()
