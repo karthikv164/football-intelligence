@@ -39,11 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.1',layout='wide')
     if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
         market_research()
         return
-    st.title('Football Intelligence V3 — Historical backtest')
+    st.title('Football Intelligence V3.1 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -74,7 +74,7 @@ def main():
         stats.append({'Model':n,'Accuracy':r[n+'_correct'].mean(),'Brier (lower better)':r[n+'_brier'].mean(),'Log loss (lower better)':r[n+'_logloss'].mean(),'Hypothetical ROI':r[n+'_return'].mean()})
     st.dataframe(pd.DataFrame(stats),hide_index=True); st.caption('Fixed one-unit hypothetical picks at recorded opening odds; execution not verified. No tuning on test results. Lower Brier/log loss is better.')
     st.write('Goals model: BTTS Brier',float(((r.btts-r.actual_btts)**2).mean()),'Over 2.5 Brier',float(((r.over_25-r.actual_over_25)**2).mean()))
-    st.subheader('Match probabilities'); st.dataframe(r,hide_index=True); st.download_button('Download V2 results',r.to_csv(index=False),'v2_results.csv','text/csv')
+    st.subheader('Match probabilities'); st.dataframe(r,hide_index=True); st.download_button('Download historical results',r.to_csv(index=False),'v2_results.csv','text/csv')
     with st.expander('Original odds movement diagnostic (different sample)'):
         st.json(s); st.dataframe(old)
     st.warning('Research only. No validated signal threshold. Scores are modal estimates, not guarantees. No xG, injuries, exchange trades or live odds integrated yet.')
@@ -83,25 +83,60 @@ def main():
 def market_research():
     import requests, json
     from datetime import datetime, timezone
-    st.title('Market research — V3 preview')
-    st.caption('Read-only market metadata. No trading, recommendations or validated exchange signals.')
-    slug=st.text_input('Polymarket football event slug (from the event URL)').strip()
-    if st.button('Load event metadata'):
-        try:
-            response=requests.get('https://gamma-api.polymarket.com/events',params={'slug':slug},timeout=20)
-            response.raise_for_status(); events=response.json()
-            if not isinstance(events,list) or not events: st.warning('No matching event returned.'); return
-            event=next((e for e in events if e.get('slug')==slug),None)
-            if not event: st.warning('Exact slug not found.'); return
-            st.subheader(event.get('title','Event'))
-            st.caption('Retrieved UTC: '+datetime.now(timezone.utc).isoformat())
-            rows=[]
+    from urllib.parse import urlparse
+    st.title('Market research — V3.1')
+    st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
+    def get(url, params):
+        r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
+    def arr(v):
+        return json.loads(v) if isinstance(v,str) else (v or [])
+    def fmt(v):
+        try: return f'{float(v):,.2f}'
+        except (ValueError,TypeError): return 'Unavailable'
+    def pct(v):
+        try: return f'{float(v):.1%}'
+        except (ValueError,TypeError): return 'Unavailable'
+    source=st.radio('Provider',['Polymarket','Kalshi'],horizontal=True)
+    if source=='Polymarket':
+        raw=st.text_input('Event URL or exact slug').strip()
+        slug=urlparse(raw).path.rstrip('/').split('/')[-1] if '://' in raw else raw
+        if st.button('Load event metadata'):
+            try:
+                events=get('https://gamma-api.polymarket.com/events',{'slug':slug})
+                event=next((e for e in events if e.get('slug')==slug),None)
+                if not event: st.warning('Exact event not found.'); return
+                st.session_state['poly_event']=(event,datetime.now(timezone.utc).isoformat())
+            except (requests.RequestException,ValueError,TypeError) as exc: st.error(str(exc)); return
+        if 'poly_event' in st.session_state:
+            event,stamp=st.session_state['poly_event']; st.subheader(event.get('title','Event')); st.caption('Retrieved UTC: '+stamp)
             for m in event.get('markets',[]):
-                rows.append({'Market':m.get('question'),'Status': 'Closed' if m.get('closed') else 'Open / verify', 'Reported volume':m.get('volume'),'Reported liquidity':m.get('liquidity'),'End date':m.get('endDate')})
-            st.dataframe(pd.DataFrame(rows),hide_index=True)
-            st.caption('Provider-reported cumulative volume and liquidity are different measures. Neither establishes trader skill or future results. Confirm event identity and settlement rules independently.')
-        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
-            st.error('Provider response unavailable or invalid. No data inferred. '+str(exc))
-    st.info('Kalshi, additional bookmakers, individual trades, xG and lineup feeds are not connected in this preview. Historical validation remains separate.')
+                with st.container(border=True):
+                    st.markdown('**'+str(m.get('question','Market'))+'**')
+                    st.caption('Closed' if m.get('closed') else 'Open / verify')
+                    outcomes=arr(m.get('outcomes')); prices=arr(m.get('outcomePrices'))
+                    for i,o in enumerate(outcomes): st.write(f'{o}: {pct(prices[i] if i<len(prices) else None)}')
+                    st.write('Best bid / ask (provider metadata):',fmt(m.get('bestBid')), '/',fmt(m.get('bestAsk')))
+                    st.write('Reported volume:',fmt(m.get('volume')),' | Liquidity:',fmt(m.get('liquidity')))
+            st.caption('Outcome prices are provider-reported snapshots, not guaranteed executable quotes. Volume includes both sides.')
+    else:
+        ticker=st.text_input('Exact Kalshi event ticker').strip().upper()
+        if st.button('Load Kalshi event'):
+            try:
+                data=get('https://api.elections.kalshi.com/trade-api/v2/events/'+requests.utils.quote(ticker,safe=''),{'with_nested_markets':'true'})
+                st.session_state['kalshi_event']=(data,datetime.now(timezone.utc).isoformat())
+            except (requests.RequestException,ValueError,TypeError) as exc: st.error(str(exc)); return
+        if 'kalshi_event' in st.session_state:
+            data,stamp=st.session_state['kalshi_event']; event=data.get('event',{}); st.subheader(event.get('title','Event')); st.caption('Retrieved UTC: '+stamp)
+            markets=event.get('markets') or data.get('markets') or []
+            if not markets: st.warning('No nested markets returned.')
+            for m in markets:
+                with st.container(border=True):
+                    st.markdown('**'+str(m.get('title','Market'))+'**'); st.caption(str(m.get('status','Unknown')))
+                    for key in ['yes_bid','yes_ask','no_bid','no_ask','last_price']:
+                        v=m.get(key+'_dollars'); legacy=m.get(key)
+                        if v is None and legacy is not None: v=float(legacy)/100
+                        st.write(key.replace('_',' ').title()+': '+pct(v))
+                    st.write('Reported volume (contracts):',m.get('volume_fp',m.get('volume','Unavailable')))
+    st.info('Provider snapshots only. Automatic discovery, trade history, cross-provider matching, additional bookmakers and lineup feeds are not yet implemented.')
 
 if __name__=='__main__': main()
