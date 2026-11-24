@@ -39,7 +39,7 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.4',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.5',layout='wide')
     workspace=st.sidebar.radio('Workspace', ['Historical backtest','Market research','Global bookmakers'])
     if workspace=='Global bookmakers':
         global_market()
@@ -47,7 +47,7 @@ def main():
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.4 — Historical backtest')
+    st.title('Football Intelligence V3.5 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -88,7 +88,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.4')
+    st.title('Market research — V3.5')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -333,7 +333,7 @@ def trade_research(snapshots, ids):
 def global_market():
     import os, requests
     from datetime import datetime, timezone
-    st.title('Global bookmaker research — V3.4')
+    st.title('Global bookmaker research — V3.5')
     st.caption('Read-only regional odds snapshots; coverage varies. No verified trading signals.')
     key=os.getenv('ODDS_API_KEY','')
     if not key:
@@ -365,7 +365,11 @@ def global_market():
                     for market in book.get('markets',[]):
                         for outcome in market.get('outcomes',[]):
                             rows.append(dict(retrieved_utc=now,event_id=event['id'],league=league,kickoff_utc=event.get('commence_time'),fixture=event['home_team']+' vs '+event['away_team'],bookmaker=book['title'],bookmaker_key=book['key'],quote_updated_utc=market.get('last_update') or book.get('last_update'),market=market['key'],outcome=outcome['name'],line=outcome.get('point'),decimal_odds=outcome.get('price')))
-            st.session_state['global_current']=pd.DataFrame(rows); st.session_state['global_remaining']=remaining
+            st.session_state['global_current']=pd.DataFrame(rows);
+            if rows:
+                history=st.session_state.get('global_history',pd.DataFrame())
+                st.session_state['global_history']=pd.concat([history,pd.DataFrame(rows)],ignore_index=True).tail(100000)
+            st.session_state['global_remaining']=remaining
         except Exception as e: st.error(str(e) if isinstance(e,ValueError) else 'Provider request failed; retry later.')
     df=st.session_state.get('global_current')
     if df is None: return
@@ -376,8 +380,90 @@ def global_market():
     selected['raw_implied_probability']=1/pd.to_numeric(selected.decimal_odds,errors='coerce').where(lambda x:x>1)
     st.dataframe(selected,hide_index=True)
     st.download_button('Export full bookmaker snapshot',df.to_csv(index=False),'global_odds_snapshot.csv','text/csv')
+    global_comparison(selected)
     st.caption('Raw implied probabilities include bookmaker margin. Export snapshots for historical comparison; first observed price is not necessarily opening odds. No bookmaker stakes or money flow are supplied.')
 
+
+
+def normalized_quotes(df):
+    rows=[]
+    for _,g in df[df.market=='h2h'].groupby(['retrieved_utc','event_id','bookmaker_key']):
+        g=g.drop_duplicates('outcome'); odds=pd.to_numeric(g.decimal_odds,errors='coerce')
+        if len(g)!=3 or not g.outcome.str.lower().eq('draw').any() or not odds.gt(1).all() or not np.isfinite(odds).all(): continue
+        raw=1/odds
+        for (_,r),v in zip(g.iterrows(),raw/raw.sum()):
+            rows.append(dict(retrieved_utc=r.retrieved_utc,event_id=r.event_id,bookmaker=r.bookmaker,bookmaker_key=r.bookmaker_key,outcome=r.outcome,probability=v,overround=raw.sum()-1,quote_updated_utc=r.quote_updated_utc))
+    return pd.DataFrame(rows)
+
+def global_comparison(selected):
+    st.subheader('Unified global market research')
+    q=normalized_quotes(selected)
+    if q.empty: st.info('No complete three-way match winner quotes.'); return
+    # Collapse regional variants with identical display names; aliases may remain.
+    q['book_group']=q.bookmaker.str.lower().str.replace(r'[^a-z0-9]','',regex=True)
+    grouped=q.groupby(['book_group','outcome']).probability.mean().reset_index()
+    consensus=grouped.groupby('outcome').probability.mean()
+    st.caption('Equal-weight mean of margin-normalized three-way quotes; identical normalized bookmaker names grouped. Not a forecast. Exchange commission is not included.')
+    st.dataframe((consensus*100).rename('Bookmaker consensus %').reset_index(),hide_index=True)
+    st.dataframe(q,hide_index=True)
+    st.caption('Provider quote timestamps and retrieval timestamps differ. Check freshness before comparing.')
+    from datetime import datetime,timezone
+    age=(pd.Timestamp.now(tz='UTC')-pd.to_datetime(q.quote_updated_utc,utc=True,errors='coerce')).dt.total_seconds()
+    st.write('Quotes older than 120 seconds:',int((age>120).sum()),'| Missing timestamps:',int(age.isna().sum()))
+    saved=st.session_state.get('comparison32')
+    if saved:
+        ids,snapshots,errors=saved
+        st.write('Previously retrieved exchange events')
+        for provider,(event,markets,stamp) in snapshots.items(): st.write(provider, event.get('title'),stamp)
+        if st.checkbox('I verified these exchange events match this fixture, date and regulation-time rules',key='globalverify'+str(selected.event_id.iloc[0])):
+            import json
+            for provider,(event,markets,stamp) in snapshots.items():
+                options={str(i)+': '+str(m.get('question') or m.get('title')):m for i,m in enumerate(markets)}
+                rows=[]
+                for outcome,p in consensus.items():
+                    label=st.selectbox(provider+' equivalent YES outcome: '+outcome,[None]+list(options),key='globalmap'+provider+outcome+str(selected.event_id.iloc[0]))
+                    if label is None: continue
+                    m=options[label]
+                    try:
+                        if provider=='Kalshi':
+                            if m.get('status')!='active': continue
+                            b=float(m['yes_bid_dollars']) if m.get('yes_bid_dollars') is not None else float(m['yes_bid'])/100
+                            a=float(m['yes_ask_dollars']) if m.get('yes_ask_dollars') is not None else float(m['yes_ask'])/100
+                        else:
+                            if not m.get('active') or m.get('closed') or not m.get('acceptingOrders'): continue
+                            b,a=float(m['bestBid']),float(m['bestAsk'])
+                        if 0<b<=a<1: rows.append({'outcome':outcome,'bookmaker consensus %':100*p,'exchange midpoint %':50*(a+b),'retrieved UTC':stamp})
+                    except (KeyError,ValueError,TypeError): pass
+                if rows: st.dataframe(pd.DataFrame(rows),hide_index=True)
+            st.caption('Manually mapped outcomes; snapshots may be asynchronous. No combined probability or trading signal.')
+    else: st.info('Retrieve both exchange snapshots in Market research → Unified search first, then return here.')
+    st.subheader('Observed odds history')
+    history=st.session_state.get('global_history',selected)
+    uploads=st.file_uploader('Optional earlier bookmaker CSV snapshots',type='csv',accept_multiple_files=True)
+    for f in uploads:
+        try:
+            d=pd.read_csv(f)
+            if not set(selected.columns)-{'raw_implied_probability'} <= set(d.columns): raise ValueError('Missing snapshot columns')
+            history=pd.concat([history,d],ignore_index=True)
+        except Exception: st.warning('Invalid snapshot: '+f.name)
+    history=history[history.event_id==selected.event_id.iloc[0]].drop_duplicates(['retrieved_utc','event_id','bookmaker_key','market','outcome','line'])
+    h=normalized_quotes(history)
+    if not h.empty:
+        h['retrieved_utc']=pd.to_datetime(h.retrieved_utc,utc=True,errors='coerce')
+        book=st.selectbox('History bookmaker',sorted(h.bookmaker_key.unique()))
+        chart=h[h.bookmaker_key==book].pivot_table(index='retrieved_utc',columns='outcome',values='probability')
+        if len(chart)>1: st.line_chart(chart)
+        else: st.info('Retrieve another snapshot to see movement.')
+    st.download_button('Export observed fixture history',history.to_csv(index=False),'fixture_history.csv','text/csv')
+    st.caption('Session history is temporary. First observed odds are not opening odds. Manual refresh only to conserve credits.')
+    st.subheader('Public transaction research')
+    trade=st.file_uploader('Optional public trades CSV for this fixture',type='csv',key='globaltrades')
+    if trade and st.checkbox('I verified the trade export belongs to this fixture and market'):
+        try:
+            t=pd.read_csv(trade); t['estimated_trade_value_usd']=pd.to_numeric(t.estimated_trade_value_usd,errors='coerce'); st.dataframe(t.nlargest(10,'estimated_trade_value_usd'),hide_index=True)
+            t['timestamp_utc']=pd.to_datetime(t.timestamp_utc,utc=True,errors='coerce'); st.bar_chart(t.dropna(subset=['timestamp_utc']).set_index('timestamp_utc').estimated_trade_value_usd.resample('5min').sum(min_count=1))
+        except Exception: st.warning('Invalid trade export.')
+    st.caption('Reported fills are not net money flow or evidence of trader skill.')
 
 if __name__=='__main__': main()
 
