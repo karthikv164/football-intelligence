@@ -39,15 +39,18 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.6',layout='wide')
-    workspace=st.sidebar.radio('Workspace', ['Historical backtest','Market research','Global bookmakers'])
+    st.set_page_config(page_title='Football Intelligence V4.1',layout='wide')
+    workspace=st.sidebar.radio('Workspace', ['Live intelligence lab','Historical backtest','Market research','Global bookmakers'])
+    if workspace=='Live intelligence lab':
+        live_lab()
+        return
     if workspace=='Global bookmakers':
         global_market()
         return
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.6 — Historical backtest')
+    st.title('Football Intelligence V4.1 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -88,7 +91,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.6')
+    st.title('Market research — V4.1')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -248,6 +251,23 @@ def unified_search():
     st.caption('Concurrent requests do not guarantee synchronized exchange quotes. Retrieval time is not quote time. Discovery is bounded and may miss fixtures. No live score feed or bookmaker coverage yet.')
     trade_research(snapshots, ids)
 
+def market_category(m):
+    import re
+    title=str(m.get('question') or m.get('title') or '').lower()
+    ticker=str(m.get('ticker') or '').upper().split('-')[0]
+    if re.search(r'wins? by|winning margin|handicap|spread',title) or 'SPREAD' in ticker:
+        return 'Handicap / winning margin'
+    if re.search(r'both teams.*scor|btts',title) or 'BTTS' in ticker:
+        return 'BTTS'
+    if re.search(r'team total|(?:will )?.+ (?:score|scores|to score) (?:over|under|more than|at least|\d)',title) or 'TEAMTOTAL' in ticker:
+        return 'Team totals'
+    if re.search(r'total goals|goals (?:scored )?in (?:the |this )?(?:match|game)|over/under|\bo/u\b',title) or ticker.endswith('TOTAL'):
+        return 'Match goal totals'
+    if re.search(r'\bwin\b|\bwins\b|\bdraw\b|\btie\b',title):
+        return 'Match winner'
+    return 'Other / unclassified'
+
+
 def expanded_markets():
     import requests, re
     from datetime import datetime, timezone
@@ -307,11 +327,22 @@ def expanded_markets():
     if not markets: st.info('No markets found. Try the exact goal-market event identifier.'); return
     def label(k):
         e,m=markets[k]; return str(m.get('question') or m.get('title') or k)+' | '+str(e.get('title',''))+' | '+k
-    category=st.selectbox('Market category',['Goal totals / BTTS','All markets'])
-    keys=[k for k in markets if category=='All markets' or re.search(r'goal|total|over|under|both teams|btts|[0-9]\.5',label(k),re.I)]
+    # Keep ambiguous markets visible but never silently treat them as match totals.
+    inventory=[]
+    for ident,(event,market) in markets.items():
+        inventory.append({'category':market_category(market),'market':market.get('question') or market.get('title'),'event':event.get('title'),'event_id':market.get('event_ticker') or event.get('slug'),'market_id':ident,'status':market.get('status'),'bid':market.get('yes_bid_dollars',market.get('bestBid')),'ask':market.get('yes_ask_dollars',market.get('bestAsk'))})
+    st.subheader('Discovered market overview')
+    st.caption('One provider snapshot. Verify event identifier, fixture date and settlement rules. Quotes are not synchronized or forecasts.')
+    inv=pd.DataFrame(inventory)
+    st.dataframe(inv,hide_index=True)
+    st.download_button('Export discovered markets',inv.to_csv(index=False),'market_inventory.csv','text/csv')
+    event_ids=list(dict.fromkeys(str(x['event_id']) for x in inventory if x['event_id']))
+    event_filter=st.selectbox('Exact event identifier (optional)', ['All discovered events']+event_ids)
+    category=st.selectbox('Market category',['Match goal totals','BTTS','Team totals','Handicap / winning margin','Match winner','Other / unclassified','All markets'])
+    keys=[x['market_id'] for x in inventory if (category=='All markets' or x['category']==category) and (event_filter=='All discovered events' or str(x['event_id'])==event_filter)]
     if not keys: st.info('No goal markets returned. Try All markets or a related event slug/ticker.'); return
     k=st.selectbox('Select exact market',keys,format_func=label)
-    e,m=markets[k]; st.caption('Retrieved UTC: '+stamp); st.write(label(k))
+    e,m=markets[k]; st.caption('Retrieved UTC: '+stamp); st.write(label(k)); st.caption('Market classification: '+market_category(m))
     if provider=='Polymarket': st.write('Reported bid / ask:',m.get('bestBid'),m.get('bestAsk'))
     else: st.write('Reported YES bid / ask:',m.get('yes_bid_dollars',m.get('yes_bid')),m.get('yes_ask_dollars',m.get('yes_ask')))
     trade_research({provider:(e,[m],stamp)},{provider:k})
@@ -404,13 +435,13 @@ def trade_research(snapshots, ids):
         if pd.isna(g): st.warning('Enter a valid UTC timestamp.')
         else:
             before=valid[(valid.timestamp_utc<g)&(valid.timestamp_utc>=g-pd.Timedelta(minutes=5))]; after=valid[(valid.timestamp_utc>=g)&(valid.timestamp_utc<=g+pd.Timedelta(minutes=5))]
-            st.write('Five-minute windows around supplied event time (descriptive only)')
-            st.dataframe(pd.DataFrame([{'window':n,'trades':len(d),'mean_yes_trade_price':d.yes_price.mean(),'estimated_value_usd':d[value].sum(min_count=1),'large_fills':int((d[value]>=threshold).sum())} for n,d in [('Before',before),('After',after)]]),hide_index=True)
+            st.write('Five-minute windows around supplied event time (descriptive only)'); st.caption('Pre-event timestamps do not prove advance knowledge: score feeds and exchange clocks may differ. Partial windows are not comparable.')
+            st.dataframe(pd.DataFrame([{'window':n,'full_time_span_covered':bool(timed.timestamp_utc.min() <= (g-pd.Timedelta(minutes=5) if n=='Before' else g) and timed.timestamp_utc.max() >= (g if n=='Before' else g+pd.Timedelta(minutes=5))),'trades':len(d),'mean_yes_trade_price':d.yes_price.mean(),'estimated_value_usd':d[value].sum(min_count=1),'large_fills':int((d[value]>=threshold).sum())} for n,d in [('Before',before),('After',after)]]),hide_index=True)
 
 def global_market():
     import os, requests
     from datetime import datetime, timezone
-    st.title('Global bookmaker research — V3.6')
+    st.title('Global bookmaker research — V4.1')
     st.caption('Read-only regional odds snapshots; coverage varies. No verified trading signals.')
     key=os.getenv('ODDS_API_KEY','')
     if not key:
@@ -553,6 +584,76 @@ def global_comparison(selected):
             t['timestamp_utc']=pd.to_datetime(t.timestamp_utc,utc=True,errors='coerce'); st.bar_chart(t.dropna(subset=['timestamp_utc']).set_index('timestamp_utc').estimated_trade_value_usd.resample('5min').sum(min_count=1))
         except Exception: st.warning('Invalid trade export.')
     st.caption('Reported fills are not net money flow or evidence of trader skill.')
+
+
+def live_lab():
+    import requests
+    st.title('V4.1 — Live match intelligence lab')
+    st.caption('Research workspace. Manual match inputs or optional API-Football feed. Scenario probabilities are not calibrated live forecasts.')
+    fixture=st.text_input('Fixture name',key='lab_fixture')
+    key=st.secrets.get('API_FOOTBALL_KEY','')
+    if key:
+        if st.button('Retrieve live fixtures (one provider request)'):
+            try:
+                r=requests.get('https://v3.football.api-sports.io/fixtures',params={'live':'all'},headers={'x-apisports-key':key},timeout=15); r.raise_for_status(); d=r.json()
+                if d.get('errors'): raise ValueError('Provider returned an error')
+                st.session_state['lab_live']=d.get('response',[])
+            except Exception: st.error('Live feed unavailable; use manual inputs.')
+        games=st.session_state.get('lab_live',[])
+        if games:
+            opts={str(x['fixture']['id']):x for x in games}; ident=st.selectbox('Live fixture',list(opts),format_func=lambda i:opts[i]['teams']['home']['name']+' vs '+opts[i]['teams']['away']['name'])
+            x=opts[ident]; st.write(x['teams']['home']['name'],x['goals'],x['teams']['away']['name'],x['fixture']['status']); st.caption('Retrieved snapshot; refresh manually. Verify match identity and status.')
+            if st.button('Retrieve statistics and lineups (two requests)'):
+                for endpoint in ['fixtures/statistics','fixtures/lineups']:
+                    try:
+                        r=requests.get('https://v3.football.api-sports.io/'+endpoint,params={'fixture':ident},headers={'x-apisports-key':key},timeout=15); r.raise_for_status(); d=r.json(); st.session_state['lab_'+endpoint]=(ident,d.get('response',[]),d.get('errors'))
+                    except Exception: st.warning(endpoint+' unavailable')
+            for endpoint in ['fixtures/statistics','fixtures/lineups']:
+                saved=st.session_state.get('lab_'+endpoint)
+                if saved and saved[0]==ident:
+                    with st.expander(endpoint): st.json(saved[1]); st.write('Provider errors:',saved[2])
+    else: st.info('Optional live feed: add API_FOOTBALL_KEY to Streamlit secrets. Coverage and quota depend on provider plan. No key needed for manual research.')
+    a,b,c=st.columns(3); h=a.number_input('Home goals',0,30,0); v=b.number_input('Away goals',0,30,0); minute=c.number_input('Minute',0,90,52)
+    st.caption('Regulation time only; enter score and minute from a verified source. No stoppage time adjustment.')
+    lh=st.number_input('Assumed home goals per 90',0.0,8.0,1.5,.1); la=st.number_input('Assumed away goals per 90',0.0,8.0,1.2,.1)
+    probs=scenario(h,v,minute,lh,la)
+    st.subheader('Goal and result scenarios')
+    st.dataframe(pd.DataFrame([{'Market':k,'Scenario probability %':round(p*100,2)} for k,p in probs.items()]),hide_index=True)
+    st.warning('Independent Poisson assumptions only. No live xG adjustment, injury adjustment, validated edge or recommended wager.')
+    st.subheader('Cross-provider comparison — verified manual quotes')
+    market=st.selectbox('Exact market',list(probs)); rows=[]
+    for provider in ['Kalshi','Polymarket','Bookmaker']:
+        val=st.text_input(provider+' implied probability (%)',key='lab_quote_'+provider)
+        if val:
+            try:
+                p=float(val); assert 0<=p<=100; rows.append({'Provider':provider,'Market':market,'Entered probability %':p})
+            except Exception: st.warning('Invalid probability for '+provider)
+    if rows: st.dataframe(pd.DataFrame(rows),hide_index=True)
+    st.caption('Manual inputs only; confirm same fixture, settlement rules, line and timestamp. Not executable prices or a validated edge.')
+    st.subheader('Large-fill review')
+    f=st.file_uploader('Upload public trades CSV',type='csv',key='lab_trade'); threshold=st.number_input('Large fill USD',1,1000000,1000)
+    if f:
+        try:
+            d=pd.read_csv(f); d['timestamp_utc']=pd.to_datetime(d.timestamp_utc,utc=True,errors='coerce'); d['estimated_trade_value_usd']=pd.to_numeric(d.estimated_trade_value_usd,errors='coerce'); ids=d.market_id.dropna().unique(); mid=st.selectbox('Exact trade market ID',ids); d=d[d.market_id==mid].dropna(subset=['timestamp_utc']); large=d[d.estimated_trade_value_usd>=threshold]; st.metric('Large fills in sample',len(large)); st.dataframe(large.sort_values('timestamp_utc',ascending=False),hide_index=True)
+            event=st.text_input('Verified goal time UTC (ISO timestamp)',key='lab_goal')
+            if event:
+                t=pd.to_datetime(event,utc=True,errors='raise'); w=pd.Timedelta(minutes=5); result=[]
+                for name,start,end in [('Before',t-w,t),('After',t,t+w)]:
+                    s=d[(d.timestamp_utc>=start)&(d.timestamp_utc<end)]; result.append({'Window':name,'Sample spans window':bool(d.timestamp_utc.min()<=start and d.timestamp_utc.max()>=end),'Fills':len(s),'Large fills':int((s.estimated_trade_value_usd>=threshold).sum())})
+                st.dataframe(pd.DataFrame(result),hide_index=True)
+            st.caption('Sample coverage is not proof of completeness. Large fills are not unique whales or net exposure.')
+        except Exception: st.warning('Invalid or unsupported trade CSV.')
+    st.download_button('Export scenario snapshot',pd.DataFrame([{'fixture':fixture,'minute':minute,'home':h,'away':v,'home_rate':lh,'away_rate':la,'market':k,'probability':p,'created_utc':pd.Timestamp.now(tz='UTC').isoformat()} for k,p in probs.items()]).to_csv(index=False),'scenario.csv','text/csv')
+
+def scenario(h,a,minute,lh,la):
+    remaining=max(0,90-minute)/90
+    def pm(rate): return np.array([math.exp(-rate)*rate**k/math.factorial(k) for k in range(40)])
+    m=np.outer(pm(lh*remaining),pm(la*remaining)); m/=m.sum(); i,j=np.indices(m.shape); H=i+h; A=j+a
+    out={'BTTS Yes':m[(H>0)&(A>0)].sum(),'Home to score again':m[i>0].sum(),'Away to score again':m[j>0].sum(),'Another goal':m[i+j>0].sum(),'Home win':m[H>A].sum(),'Draw':m[H==A].sum(),'Away win':m[H<A].sum()}
+    for line in [1.5,2.5,3.5,4.5,5.5]:
+        out[f'Over {line}']=m[H+A>line].sum(); out[f'Under {line}']=1-out[f'Over {line}']
+        for label,goals in [('Home',H),('Away',A)]: out[f'{label} over {line}']=m[goals>line].sum()
+    out['BTTS No']=1-out['BTTS Yes']; return {k:float(np.clip(p,0,1)) for k,p in out.items()}
 
 if __name__=='__main__': main()
 
