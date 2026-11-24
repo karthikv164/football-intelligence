@@ -39,11 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.3',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.3.1',layout='wide')
     if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.3 — Historical backtest')
+    st.title('Football Intelligence V3.3.1 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -84,7 +84,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.3')
+    st.title('Market research — V3.3.1')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -257,13 +257,27 @@ def trade_research(snapshots, ids):
         try:
             x=float(v); return x if math.isfinite(x) else None
         except (ValueError,TypeError): return None
+    pages=st.selectbox('Maximum pages (500 trades per page)',[1,2,5,10])
     if st.button('Load recent public trades'):
         provider,ident=selected; rows=[]; error=None
         try:
-            if provider=='Polymarket':
-                r=requests.get('https://data-api.polymarket.com/trades',params={'market':ident,'limit':500,'takerOnly':'true'},timeout=20); r.raise_for_status(); trades=r.json()
-            else:
-                r=requests.get('https://api.elections.kalshi.com/trade-api/v2/markets/trades',params={'ticker':ident,'limit':500},timeout=20); r.raise_for_status(); trades=r.json().get('trades',[])
+            trades=[]; cursor=None; seen=set()
+            for _ in range(pages):
+                if provider=='Polymarket':
+                    url='https://data-api.polymarket.com/v2/trades'
+                    params={'condition':ident,'limit':500,'taker_only':'true'}
+                else:
+                    url='https://api.elections.kalshi.com/trade-api/v2/markets/trades'
+                    params={'ticker':ident,'limit':500}
+                if cursor: params['cursor']=cursor
+                r=requests.get(url,params=params,timeout=20); r.raise_for_status(); payload=r.json()
+                batch=payload['data'] if provider=='Polymarket' else payload['trades']
+                if not isinstance(batch,list): raise ValueError('Unexpected trade response')
+                trades.extend(batch)
+                cursor=(payload.get('pagination') or {}).get('next_cursor') if provider=='Polymarket' else payload.get('cursor')
+                if not cursor: break
+                if cursor in seen: raise ValueError('Repeated pagination cursor')
+                seen.add(cursor)
             for t in trades:
                 if provider=='Polymarket':
                     price=number(t.get('price')); size=number(t.get('size')); side=t.get('side'); outcome=t.get('outcome'); ts=pd.to_datetime(t.get('timestamp'),unit='s',utc=True,errors='coerce'); yes=price if str(outcome).lower()=='yes' else 1-price if price is not None and str(outcome).lower()=='no' else None
@@ -272,7 +286,7 @@ def trade_research(snapshots, ids):
                     if yes is None and old is not None: yes=old/100
                     size=number(t.get('count_fp',t.get('count'))); side=t.get('taker_side'); outcome=side; ts=pd.to_datetime(t.get('created_time'),utc=True,errors='coerce'); price=yes if side=='yes' else 1-yes if side=='no' and yes is not None else None
                 notional=price*size if price is not None and size is not None and 0<=price<=1 and size>=0 else None
-                rows.append(dict(provider=provider,market_id=ident,timestamp_utc=ts,outcome=outcome,reported_side=side,price=price,yes_price=yes,contracts=size,estimated_trade_value_usd=notional,trade_id=t.get('trade_id',t.get('transactionHash'))))
+                rows.append(dict(provider=provider,market_id=ident,timestamp_utc=ts,outcome=outcome,reported_side=side,price=price,yes_price=yes,contracts=size,estimated_trade_value_usd=notional,trade_id=t.get('trade_id',t.get('transaction_hash',t.get('transactionHash')))))
         except Exception as exc: error=str(exc)
         st.session_state['trades33']=(selected,rows,error,datetime.now(timezone.utc).isoformat())
     saved=st.session_state.get('trades33')
@@ -280,12 +294,29 @@ def trade_research(snapshots, ids):
     _,rows,error,retrieved=saved
     if error: st.error(error); return
     if not rows: st.info('No public trades returned.'); return
-    df=pd.DataFrame(rows).sort_values('timestamp_utc'); st.caption('Retrieved UTC: '+retrieved+' | Returned trades: '+str(len(df))+' (maximum 500; not complete history)')
+    df=pd.DataFrame(rows).sort_values('timestamp_utc'); st.caption('Retrieved UTC: '+retrieved+' | Returned trades: '+str(len(df))+' (bounded sample; not necessarily complete history)')
     st.dataframe(df,hide_index=True)
     st.download_button('Download trade CSV',df.to_csv(index=False),'public_trades.csv','text/csv')
     valid=df.dropna(subset=['timestamp_utc','yes_price'])
     if not valid.empty: st.line_chart(valid.set_index('timestamp_utc')['yes_price'])
     st.caption('Estimated trade value is contracts × reported side price, not net money flow or account exposure. No trader identities or skill rankings are inferred.')
+    st.subheader('Transaction activity summary')
+    value='estimated_trade_value_usd'
+    st.dataframe(df.groupby(['outcome','reported_side'],dropna=False).agg(trades=('price','size'),quantity=('contracts',lambda x:x.sum(min_count=1)),estimated_value=(value,lambda x:x.sum(min_count=1))).reset_index(),hide_index=True)
+    st.write('Largest 10 reported fills')
+    st.dataframe(df.dropna(subset=[value]).nlargest(10,value),hide_index=True)
+    threshold=st.number_input('Large fill threshold (estimated USD)',min_value=1,value=1000,step=100)
+    st.write('Fills meeting threshold:',int((df[value]>=threshold).sum()))
+    timed=df.dropna(subset=['timestamp_utc']).copy()
+    if not timed.empty:
+        latest=timed.timestamp_utc.max()
+        windows=[]
+        for minutes in [1,5,15]:
+            subset=timed[timed.timestamp_utc>latest-pd.Timedelta(minutes=minutes)]
+            windows.append({'minutes_before_latest_trade':minutes,'sample_covers_window':timed.timestamp_utc.min()<=latest-pd.Timedelta(minutes=minutes),'trades':len(subset),'estimated_value':subset[value].sum(min_count=1)})
+        st.dataframe(pd.DataFrame(windows),hide_index=True)
+        st.bar_chart(timed.set_index('timestamp_utc')[value].resample('1min').sum(min_count=1))
+    st.caption('Large fills do not establish unique traders, net exposure, or predictive skill. Transaction hashes may identify multiple fills; they are not unique fill IDs. Download CSV to retain snapshots; server session storage is temporary.')
     goal=st.text_input('Optional match event time (UTC ISO format, e.g. 2026-11-24T02:00:00Z)')
     if goal:
         g=pd.to_datetime(goal,utc=True,errors='coerce')
