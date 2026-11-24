@@ -39,8 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V4.1',layout='wide')
-    workspace=st.sidebar.radio('Workspace', ['Live intelligence lab','Historical backtest','Market research','Global bookmakers'])
+    st.set_page_config(page_title='Football Intelligence V4.2',layout='wide')
+    workspace=st.sidebar.radio('Workspace', ['Market intelligence','Market research','Global bookmakers','Historical backtest','Live intelligence lab'])
+    if workspace=='Market intelligence':
+        market_first()
+        return
     if workspace=='Live intelligence lab':
         live_lab()
         return
@@ -50,7 +53,7 @@ def main():
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V4.1 — Historical backtest')
+    st.title('Football Intelligence V4.2 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -91,7 +94,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V4.1')
+    st.title('Market research — V4.2')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -441,7 +444,7 @@ def trade_research(snapshots, ids):
 def global_market():
     import os, requests
     from datetime import datetime, timezone
-    st.title('Global bookmaker research — V4.1')
+    st.title('Global bookmaker research — V4.2')
     st.caption('Read-only regional odds snapshots; coverage varies. No verified trading signals.')
     key=os.getenv('ODDS_API_KEY','')
     if not key:
@@ -588,7 +591,7 @@ def global_comparison(selected):
 
 def live_lab():
     import requests
-    st.title('V4.1 — Live match intelligence lab')
+    st.title('V4.2 — Live match intelligence lab')
     st.caption('Research workspace. Manual match inputs or optional API-Football feed. Scenario probabilities are not calibrated live forecasts.')
     fixture=st.text_input('Fixture name',key='lab_fixture')
     key=st.secrets.get('API_FOOTBALL_KEY','')
@@ -654,6 +657,89 @@ def scenario(h,a,minute,lh,la):
         out[f'Over {line}']=m[H+A>line].sum(); out[f'Under {line}']=1-out[f'Over {line}']
         for label,goals in [('Home',H),('Away',A)]: out[f'{label} over {line}']=m[goals>line].sum()
     out['BTTS No']=1-out['BTTS Yes']; return {k:float(np.clip(p,0,1)) for k,p in out.items()}
+
+def market_first():
+    import requests
+    st.title('Football Intelligence V4.2 — Market first')
+    st.caption('Pre-match exchange research. No automatic betting, paid feed or live-score dependency.')
+    def get(base,path,params):
+        r=requests.get(base+path,params=params,timeout=20); r.raise_for_status(); return r.json()
+    P='https://gamma-api.polymarket.com'; K='https://api.elections.kalshi.com/trade-api/v2'; D='https://data-api.polymarket.com'
+    q=st.text_input('Football fixture / team search')
+    series=st.text_input('Kalshi football series tickers (comma separated)', 'KXMLSGAME,KXMLSTOTAL')
+    if st.button('Discover Kalshi sports series'):
+        try:
+            s=get(K,'/series',{'category':'Sports'}).get('series',[])
+            st.session_state['series42']=pd.DataFrame([{'ticker':x.get('ticker'),'title':x.get('title'),'tags':str(x.get('tags'))} for x in s])
+        except Exception as e: st.error(str(e))
+    if 'series42' in st.session_state:
+        with st.expander('Series catalog — choose football series only'): st.dataframe(st.session_state['series42'])
+    if st.button('Discover / refresh markets',type='primary'):
+        rows=[]; errors=[]; now=pd.Timestamp.now(tz='UTC'); events=[]
+        if q.strip():
+            try: events.extend(('Polymarket',e) for e in get(P,'/public-search',{'q':q,'limit_per_type':50}).get('events',[]))
+            except Exception as e: errors.append('Polymarket: '+str(e))
+        for s in [x.strip().upper() for x in series.split(',') if x.strip()][:12]:
+            try:
+                cursor=None
+                for _ in range(3):
+                    params={'series_ticker':s,'status':'open','with_nested_markets':'true','limit':200}
+                    if cursor: params['cursor']=cursor
+                    d=get(K,'/events',params); events.extend(('Kalshi',e) for e in d.get('events',[])); cursor=d.get('cursor')
+                    if not cursor: break
+                if cursor: errors.append(s+': discovery truncated at three pages')
+            except Exception as e: errors.append(s+': '+str(e))
+        for provider,e in events:
+            for m in e.get('markets',[]):
+                title=m.get('question') or m.get('title') or ''; event=e.get('title',''); ident=m.get('conditionId') if provider=='Polymarket' else m.get('ticker')
+                if not ident or m.get('closed') or m.get('status') in ['closed','settled','finalized']: continue
+                if q.strip() and not any(w.lower() in (title+' '+event).lower() for w in q.split() if len(w)>2 and w.lower()!='versus'): continue
+                kickoff=pd.to_datetime(m.get('gameStartTime') or e.get('startTime') or e.get('gameStartTime'),utc=True,errors='coerce')
+                def num(v):
+                    try: return float(v)
+                    except (TypeError,ValueError): return np.nan
+                bid=num(m.get('bestBid') if provider=='Polymarket' else m.get('yes_bid_dollars')); ask=num(m.get('bestAsk') if provider=='Polymarket' else m.get('yes_ask_dollars'))
+                rows.append(dict(retrieved_utc=now,provider=provider,event=event,market=title,category=market_category(m),market_id=ident,kickoff_utc=kickoff,phase='Upcoming (provider time)' if pd.notna(kickoff) and kickoff>now else 'Started or time unknown',bid=bid,ask=ask,mid=(bid+ask)/2 if 0<=bid<=ask<=1 else np.nan,volume=num(m.get('volumeNum',m.get('volume')) if provider=='Polymarket' else m.get('volume_fp',m.get('volume'))),volume_unit='Provider USD volume' if provider=='Polymarket' else 'Contracts',liquidity=num(m.get('liquidityNum',m.get('liquidity'))) if provider=='Polymarket' else np.nan))
+        df=pd.DataFrame(rows)
+        if not df.empty: df=df.drop_duplicates(['provider','market_id']); st.session_state['history42']=pd.concat([st.session_state.get('history42',pd.DataFrame()),df],ignore_index=True).tail(50000)
+        st.session_state['current42']=df; st.session_state['errors42']=errors
+    for e in st.session_state.get('errors42',[]): st.warning(e)
+    df=st.session_state.get('current42',pd.DataFrame())
+    if df.empty: st.info('Search a fixture or select football series. Discovery is bounded; verify sport, fixture and kickoff.'); return
+    st.caption('Volume units differ across exchanges; never sum them. Unknown kickoff is not confirmed pre-match. Polymarket bid/ask refers to first outcome; verify outcome and rules.')
+    cats=st.multiselect('Market categories',sorted(df.category.unique()),default=sorted(df.category.unique()))
+    view=df[df.category.isin(cats)]
+    if st.checkbox('Only provider-confirmed future kickoff'): view=view[view.phase=='Upcoming (provider time)']
+    for provider,g in view.groupby('provider'):
+        st.subheader(provider); st.dataframe(g.sort_values('volume',ascending=False),hide_index=True)
+    st.download_button('Export market inventory',df.to_csv(index=False),'market_inventory.csv')
+    history=st.session_state['history42']; st.download_button('Export session snapshots',history.to_csv(index=False),'market_history.csv')
+    if view.empty: return
+    keys=list(zip(view.provider,view.market_id)); labels={(r.provider,r.market_id):r.market for r in view.itertuples()}
+    chosen=st.multiselect('Compare exact markets (verify same outcome and settlement)',keys,format_func=lambda k:k[0]+' — '+labels[k],max_selections=6)
+    for p,i in chosen:
+        g=history[(history.provider==p)&(history.market_id==i)].sort_values('retrieved_utc'); st.write(p+' — '+labels[(p,i)]); st.line_chart(g.set_index('retrieved_utc')['mid']); st.caption('Observed snapshots, not opening odds or continuous history.')
+    selected=st.selectbox('Inspect transactions',keys,format_func=lambda k:k[0]+' — '+labels[k]); p,i=selected
+    trade_research({p:({},[{'conditionId':i,'ticker':i,'title':labels[selected]}],'')},{p:i})
+    if p=='Polymarket':
+        st.subheader('Public wallet research')
+        if st.button('Load wallet-level recent fills'):
+            try:
+                data=get(D,'/trades',{'market':i,'limit':500,'takerOnly':'true'}); w=pd.DataFrame(data); st.session_state['wallet42']=(i,w)
+            except Exception as e: st.error(str(e))
+        saved=st.session_state.get('wallet42')
+        if saved and saved[0]==i:
+            w=saved[1]; cols=['proxyWallet','side','outcome','price','size','timestamp']
+            if set(cols)<=set(w):
+                w=w[cols].copy(); w['estimated_value']=pd.to_numeric(w.price,errors='coerce')*pd.to_numeric(w['size'],errors='coerce'); st.dataframe(w.sort_values('estimated_value',ascending=False)); st.download_button('Export wallet fills',w.to_csv(index=False),'wallet_fills.csv')
+                wallet=st.selectbox('Public wallet',w.proxyWallet.dropna().unique())
+                if st.button('Load reported closed positions'):
+                    try:
+                        c=pd.DataFrame(get(D,'/closed-positions',{'user':wallet,'limit':50})); st.dataframe(c); st.caption('Bounded closed positions, not lifetime performance; selection bias and open losses excluded.')
+                    except Exception as e: st.error(str(e))
+            else: st.info('Wallet fields unavailable.')
+    st.caption('Historical validation: use Historical backtest for existing football model tests. Exchange signal validation requires archived pre-match snapshots and settlement labels; not yet established.')
+
 
 if __name__=='__main__': main()
 
