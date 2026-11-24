@@ -39,7 +39,7 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V4.2',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V4.3',layout='wide')
     workspace=st.sidebar.radio('Workspace', ['Market intelligence','Market research','Global bookmakers','Historical backtest','Live intelligence lab'])
     if workspace=='Market intelligence':
         market_first()
@@ -53,7 +53,7 @@ def main():
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V4.2 — Historical backtest')
+    st.title('Football Intelligence V4.3 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -258,6 +258,7 @@ def market_category(m):
     import re
     title=str(m.get('question') or m.get('title') or '').lower()
     ticker=str(m.get('ticker') or '').upper().split('-')[0]
+    if re.search(r'corners|yellow cards|red cards|shots|offsides|fouls|first half|1st half',title) or any(x in ticker for x in ['CORNER','CARD','SHOT','1H','2H']): return 'Other / unclassified'
     if re.search(r'wins? by|winning margin|handicap|spread',title) or 'SPREAD' in ticker:
         return 'Handicap / winning margin'
     if re.search(r'both teams.*scor|btts',title) or 'BTTS' in ticker:
@@ -658,60 +659,87 @@ def scenario(h,a,minute,lh,la):
         for label,goals in [('Home',H),('Away',A)]: out[f'{label} over {line}']=m[goals>line].sum()
     out['BTTS No']=1-out['BTTS Yes']; return {k:float(np.clip(p,0,1)) for k,p in out.items()}
 
+def soccer_series(x):
+    import re
+    t=str(x.get('ticker','')).upper()
+    tags=' '.join(map(str,x.get('tags') or [])).lower()
+    title=str(x.get('title','')).lower()
+    if re.search(r'\b(soccer|association football)\b',tags+' '+title): return True
+    return bool(re.match(r'^KX(?:MLS|EPL|UCL|UEL|UECL|LALIGA|LIGUE1|LIGUE2|BUNDESLIGA|SERIEA|SERIEB|BRASILEIRO|LIBERTADORES|SUDAMERICANA|CONCACAF|ITASUPERCUP|FACUP|EFLCUP|EREDIVISIE|LIGAMX|NWSL|WSL|COPAAMERICA|FIFAWORLDCUP|UEFANATIONS|SCOTTISHPREM|PRIMEIRALIGA)',t))
+
 def market_first():
     import requests
-    st.title('Football Intelligence V4.2 — Market first')
-    st.caption('Pre-match exchange research. No automatic betting, paid feed or live-score dependency.')
+    from concurrent.futures import ThreadPoolExecutor
+    st.title('Football Intelligence V4.3 — Global market scanner')
+    st.caption('Market-first research. Bounded public exchange coverage; no paid feed or live-score dependency.')
     def get(base,path,params):
-        r=requests.get(base+path,params=params,timeout=20); r.raise_for_status(); return r.json()
+        r=requests.get(base+path,params=params,timeout=15); r.raise_for_status(); return r.json()
     P='https://gamma-api.polymarket.com'; K='https://api.elections.kalshi.com/trade-api/v2'; D='https://data-api.polymarket.com'
-    q=st.text_input('Football fixture / team search')
-    series=st.text_input('Kalshi football series tickers (comma separated)', 'KXMLSGAME,KXMLSTOTAL')
-    if st.button('Discover Kalshi sports series'):
-        try:
-            s=get(K,'/series',{'category':'Sports'}).get('series',[])
-            st.session_state['series42']=pd.DataFrame([{'ticker':x.get('ticker'),'title':x.get('title'),'tags':str(x.get('tags'))} for x in s])
-        except Exception as e: st.error(str(e))
-    if 'series42' in st.session_state:
-        with st.expander('Series catalog — choose football series only'): st.dataframe(st.session_state['series42'])
-    if st.button('Discover / refresh markets',type='primary'):
+    horizon=st.radio('Upcoming kickoff window (hours)',[24,48,72],horizontal=True,index=2)
+    q=st.text_input('Optional team / fixture filter')
+    budget=st.selectbox('Kalshi series per scan',[12,30,60],index=1)
+    if st.button('Scan global football markets',type='primary') or 'current42' not in st.session_state:
         rows=[]; errors=[]; now=pd.Timestamp.now(tz='UTC'); events=[]
-        if q.strip():
-            try: events.extend(('Polymarket',e) for e in get(P,'/public-search',{'q':q,'limit_per_type':50}).get('events',[]))
-            except Exception as e: errors.append('Polymarket: '+str(e))
-        for s in [x.strip().upper() for x in series.split(',') if x.strip()][:12]:
+        with st.spinner('Discovering football series and markets…'):
             try:
-                cursor=None
-                for _ in range(3):
-                    params={'series_ticker':s,'status':'open','with_nested_markets':'true','limit':200}
-                    if cursor: params['cursor']=cursor
-                    d=get(K,'/events',params); events.extend(('Kalshi',e) for e in d.get('events',[])); cursor=d.get('cursor')
-                    if not cursor: break
-                if cursor: errors.append(s+': discovery truncated at three pages')
-            except Exception as e: errors.append(s+': '+str(e))
+                catalog=get(K,'/series',{'category':'Sports'}).get('series',[])
+                series=[x for x in catalog if soccer_series(x) and str(x.get('ticker','')).endswith(('GAME','TOTAL','BTTS','TEAMTOTAL','TTOTAL'))]
+                series=sorted(series,key=lambda x:str(x.get('ticker')))
+                st.session_state['soccer_catalog43']=series
+                if len(series)>budget: errors.append(f'Kalshi: scanning {budget} of {len(series)} candidate series; use next batch to expand.')
+                offset=st.session_state.get('offset43',0)%max(1,len(series)); batch=(series[offset:]+series[:offset])[:budget]; st.session_state['offset43']=offset+budget
+                def scan(x):
+                    try:
+                        d=get(K,'/events',{'series_ticker':x['ticker'],'status':'open','with_nested_markets':'true','limit':200})
+                        return [('Kalshi',e) for e in d.get('events',[])], ([x['ticker']+': page limit reached'] if d.get('cursor') else [])
+                    except Exception as e: return [],[x['ticker']+': '+str(e)]
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    for ev,err in pool.map(scan,batch): events.extend(ev); errors.extend(err)
+            except Exception as e: errors.append('Kalshi catalog: '+str(e))
+            try:
+                tags=get(P,'/tags',{'limit':100,'offset':0})
+                soccer=next((t for t in tags if str(t.get('slug','')).lower() in ('soccer','football-soccer')),None)
+                if soccer is None:
+                    soccer=get(P,'/tags/slug/soccer',{})
+                for offset in (0,100,200):
+                    page=get(P,'/events',{'tag_id':soccer['id'],'active':'true','closed':'false','limit':100,'offset':offset,'order':'volume','ascending':'false'})
+                    events.extend(('Polymarket',e) for e in page)
+                    if len(page)<100: break
+                else: errors.append('Polymarket soccer discovery capped at 300 events.')
+            except Exception as e: errors.append('Polymarket soccer catalog: '+str(e))
         for provider,e in events:
-            for m in e.get('markets',[]):
+            for m in e.get('markets') or []:
                 title=m.get('question') or m.get('title') or ''; event=e.get('title',''); ident=m.get('conditionId') if provider=='Polymarket' else m.get('ticker')
-                if not ident or m.get('closed') or m.get('status') in ['closed','settled','finalized']: continue
-                if q.strip() and not any(w.lower() in (title+' '+event).lower() for w in q.split() if len(w)>2 and w.lower()!='versus'): continue
-                kickoff=pd.to_datetime(m.get('gameStartTime') or e.get('startTime') or e.get('gameStartTime'),utc=True,errors='coerce')
+                if not ident or m.get('closed') or m.get('status') in ['closed','settled','finalized'] or m.get('active') is False: continue
+                category=market_category(m)
+                if category not in ['Match goal totals','BTTS','Team totals','Match winner']: continue
+                kickoff=pd.to_datetime(m.get('gameStartTime') or e.get('gameStartTime') or e.get('startTime'),utc=True,errors='coerce')
                 def num(v):
                     try: return float(v)
                     except (TypeError,ValueError): return np.nan
                 bid=num(m.get('bestBid') if provider=='Polymarket' else m.get('yes_bid_dollars')); ask=num(m.get('bestAsk') if provider=='Polymarket' else m.get('yes_ask_dollars'))
-                rows.append(dict(retrieved_utc=now,provider=provider,event=event,market=title,category=market_category(m),market_id=ident,kickoff_utc=kickoff,phase='Upcoming (provider time)' if pd.notna(kickoff) and kickoff>now else 'Started or time unknown',bid=bid,ask=ask,mid=(bid+ask)/2 if 0<=bid<=ask<=1 else np.nan,volume=num(m.get('volumeNum',m.get('volume')) if provider=='Polymarket' else m.get('volume_fp',m.get('volume'))),volume_unit='Provider USD volume' if provider=='Polymarket' else 'Contracts',liquidity=num(m.get('liquidityNum',m.get('liquidity'))) if provider=='Polymarket' else np.nan))
+                rows.append(dict(retrieved_utc=now,provider=provider,event=event,market=title,category=category,market_id=ident,kickoff_utc=kickoff,phase='Upcoming (provider time)' if pd.notna(kickoff) and kickoff>now else 'Started or time unknown',bid=bid,ask=ask,mid=(bid+ask)/2 if 0<=bid<=ask<=1 else np.nan,volume=num(m.get('volumeNum',m.get('volume')) if provider=='Polymarket' else m.get('volume_fp',m.get('volume'))),volume_unit='Provider USD volume' if provider=='Polymarket' else 'Contracts',liquidity=num(m.get('liquidityNum',m.get('liquidity')) if provider=='Polymarket' else m.get('liquidity_dollars'))))
         df=pd.DataFrame(rows)
-        if not df.empty: df=df.drop_duplicates(['provider','market_id']); st.session_state['history42']=pd.concat([st.session_state.get('history42',pd.DataFrame()),df],ignore_index=True).tail(50000)
+        if not df.empty:
+            df=df.drop_duplicates(['provider','market_id']); st.session_state['history42']=pd.concat([st.session_state.get('history42',pd.DataFrame()),df],ignore_index=True).tail(50000)
         st.session_state['current42']=df; st.session_state['errors42']=errors
+    with st.expander('Discovered soccer series'):
+        st.dataframe(pd.DataFrame(st.session_state.get('soccer_catalog43',[])),hide_index=True)
     for e in st.session_state.get('errors42',[]): st.warning(e)
     df=st.session_state.get('current42',pd.DataFrame())
     if df.empty: st.info('Search a fixture or select football series. Discovery is bounded; verify sport, fixture and kickoff.'); return
     st.caption('Volume units differ across exchanges; never sum them. Unknown kickoff is not confirmed pre-match. Polymarket bid/ask refers to first outcome; verify outcome and rules.')
     cats=st.multiselect('Market categories',sorted(df.category.unique()),default=sorted(df.category.unique()))
-    view=df[df.category.isin(cats)]
-    if st.checkbox('Only provider-confirmed future kickoff'): view=view[view.phase=='Upcoming (provider time)']
+    view=df[df.category.isin(cats)].copy()
+    now=pd.Timestamp.now(tz='UTC'); kickoff=pd.to_datetime(view.kickoff_utc,utc=True,errors='coerce')
+    include_unknown=st.checkbox('Include unknown kickoff (not verified pre-match)',value=True)
+    view=view[((kickoff>now)&(kickoff<=now+pd.Timedelta(hours=horizon))) | (kickoff.isna() & include_unknown)]
+    if q.strip(): view=view[(view.event+' '+view.market).str.contains(q.strip(),case=False,regex=False)]
+    st.metric('Markets in current view',len(view))
+    sort=st.radio('Rank within each exchange',['volume','liquidity'],horizontal=True)
+    st.caption('Unknown kickoff markets are not verified upcoming. Scan again to rotate through candidate series.')
     for provider,g in view.groupby('provider'):
-        st.subheader(provider); st.dataframe(g.sort_values('volume',ascending=False),hide_index=True)
+        st.subheader(provider); st.dataframe(g.sort_values(sort,ascending=False),hide_index=True)
     st.download_button('Export market inventory',df.to_csv(index=False),'market_inventory.csv')
     history=st.session_state['history42']; st.download_button('Export session snapshots',history.to_csv(index=False),'market_history.csv')
     if view.empty: return
