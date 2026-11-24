@@ -39,8 +39,11 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V2',layout='wide')
-    st.title('Football Intelligence V2')
+    st.set_page_config(page_title='Football Intelligence V3',layout='wide')
+    if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
+        market_research()
+        return
+    st.title('Football Intelligence V3 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -75,5 +78,30 @@ def main():
     with st.expander('Original odds movement diagnostic (different sample)'):
         st.json(s); st.dataframe(old)
     st.warning('Research only. No validated signal threshold. Scores are modal estimates, not guarantees. No xG, injuries, exchange trades or live odds integrated yet.')
+
+
+def market_research():
+    import requests, json
+    from datetime import datetime, timezone
+    st.title('Market research — V3 preview')
+    st.caption('Read-only market metadata. No trading, recommendations or validated exchange signals.')
+    slug=st.text_input('Polymarket football event slug (from the event URL)').strip()
+    if st.button('Load event metadata'):
+        try:
+            response=requests.get('https://gamma-api.polymarket.com/events',params={'slug':slug},timeout=20)
+            response.raise_for_status(); events=response.json()
+            if not isinstance(events,list) or not events: st.warning('No matching event returned.'); return
+            event=next((e for e in events if e.get('slug')==slug),None)
+            if not event: st.warning('Exact slug not found.'); return
+            st.subheader(event.get('title','Event'))
+            st.caption('Retrieved UTC: '+datetime.now(timezone.utc).isoformat())
+            rows=[]
+            for m in event.get('markets',[]):
+                rows.append({'Market':m.get('question'),'Status': 'Closed' if m.get('closed') else 'Open / verify', 'Reported volume':m.get('volume'),'Reported liquidity':m.get('liquidity'),'End date':m.get('endDate')})
+            st.dataframe(pd.DataFrame(rows),hide_index=True)
+            st.caption('Provider-reported cumulative volume and liquidity are different measures. Neither establishes trader skill or future results. Confirm event identity and settlement rules independently.')
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            st.error('Provider response unavailable or invalid. No data inferred. '+str(exc))
+    st.info('Kalshi, additional bookmakers, individual trades, xG and lineup feeds are not connected in this preview. Historical validation remains separate.')
 
 if __name__=='__main__': main()
