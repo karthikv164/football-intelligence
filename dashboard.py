@@ -39,7 +39,7 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.5',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V3.6',layout='wide')
     workspace=st.sidebar.radio('Workspace', ['Historical backtest','Market research','Global bookmakers'])
     if workspace=='Global bookmakers':
         global_market()
@@ -47,7 +47,7 @@ def main():
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.5 — Historical backtest')
+    st.title('Football Intelligence V3.6 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -88,7 +88,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.5')
+    st.title('Market research — V3.6')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -100,7 +100,10 @@ def market_research():
     def pct(v):
         try: return f'{float(v):.1%}'
         except (ValueError,TypeError): return 'Unavailable'
-    source=st.radio('Provider',['Unified search','Polymarket','Kalshi'],horizontal=True)
+    source=st.radio('Provider',['Goal markets & large trades','Unified search','Polymarket','Kalshi'],horizontal=True)
+    if source=='Goal markets & large trades':
+        expanded_markets()
+        return
     if source=='Unified search':
         unified_search()
         return
@@ -245,6 +248,74 @@ def unified_search():
     st.caption('Concurrent requests do not guarantee synchronized exchange quotes. Retrieval time is not quote time. Discovery is bounded and may miss fixtures. No live score feed or bookmaker coverage yet.')
     trade_research(snapshots, ids)
 
+def expanded_markets():
+    import requests, re
+    from datetime import datetime, timezone
+    from urllib.parse import urlparse
+    st.subheader('Goal markets and large trades')
+    st.caption('Search related events or enter exact provider identifiers. Verify fixture, date, line and settlement before interpreting trades.')
+    provider=st.radio('Exchange',['Polymarket','Kalshi'],horizontal=True,key='expanded_provider')
+    query=st.text_input('Fixture search',placeholder='St Louis Los Angeles',key='expanded_query')
+    exact=st.text_input('Exact event slug / URL or Kalshi event ticker',key='expanded_exact')
+    ticker=st.text_input('Optional exact Kalshi market ticker',key='expanded_ticker') if provider=='Kalshi' else ''
+    def get(url,params):
+        r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
+    if st.button('Discover goal markets',type='primary'):
+        events=[]; errors=[]
+        P='https://gamma-api.polymarket.com'; K='https://api.elections.kalshi.com/trade-api/v2'
+        def attempt(fn):
+            try: fn()
+            except Exception as e: errors.append(str(e))
+        if provider=='Polymarket':
+            slug=urlparse(exact).path.rstrip('/').split('/')[-1] if '://' in exact else exact.strip()
+            if slug: attempt(lambda:events.extend(get(P+'/events',{'slug':slug})))
+            if query.strip():
+                for term in [query,query+' totals',query+' goals']:
+                    attempt(lambda:events.extend(get(P+'/public-search',{'q':term,'limit_per_type':30}).get('events',[])))
+        else:
+            def load_event(t):
+                d=get(K+'/events/'+requests.utils.quote(t,safe=''),{'with_nested_markets':'true'}); e=d.get('event',{}); e['markets']=e.get('markets') or d.get('markets') or []; events.append(e)
+            if exact.strip(): load_id=exact.strip().upper(); attempt(lambda:load_event(load_id))
+            if ticker.strip():
+                def load_market():
+                    m=get(K+'/markets/'+requests.utils.quote(ticker.strip().upper(),safe=''),{}).get('market',{}); events.append({'title':m.get('event_ticker'),'markets':[m]})
+                attempt(load_market)
+            if query.strip():
+                # Discover related series from the provider catalog rather than guessing tickers.
+                def search_series():
+                    series=get(K+'/series',{'category':'Sports'}).get('series',[])
+                    candidates=[x for x in series if any(w in str(x.get('title','')).lower() for w in ['soccer','mls','football']) and any(w in str(x.get('title','')).lower() for w in ['goal','total','score','mls'])]
+                    words=set(re.findall(r'[a-z0-9]+',query.lower()))-{'vs','fc','sc','the'}
+                    for x in candidates[:20]:
+                        def scan():
+                            d=get(K+'/events',{'series_ticker':x['ticker'],'status':'open','with_nested_markets':'true','limit':200})
+                            for e in d.get('events',[]):
+                                title=set(re.findall(r'[a-z0-9]+',str(e.get('title','')).lower()))
+                                if len(words & title)>=min(2,len(words)) and words: events.append(e)
+                        attempt(scan)
+                attempt(search_series)
+        st.session_state['expanded36']=(provider,events,errors,datetime.now(timezone.utc).isoformat())
+    saved=st.session_state.get('expanded36')
+    if not saved or saved[0]!=provider: return
+    _,events,errors,stamp=saved
+    for e in errors: st.warning(e)
+    markets={}
+    for e in events:
+        for m in e.get('markets',[]):
+            ident=m.get('conditionId') if provider=='Polymarket' else m.get('ticker')
+            if ident: markets[ident]=(e,m)
+    if not markets: st.info('No markets found. Try the exact goal-market event identifier.'); return
+    def label(k):
+        e,m=markets[k]; return str(m.get('question') or m.get('title') or k)+' | '+str(e.get('title',''))+' | '+k
+    category=st.selectbox('Market category',['Goal totals / BTTS','All markets'])
+    keys=[k for k in markets if category=='All markets' or re.search(r'goal|total|over|under|both teams|btts|[0-9]\.5',label(k),re.I)]
+    if not keys: st.info('No goal markets returned. Try All markets or a related event slug/ticker.'); return
+    k=st.selectbox('Select exact market',keys,format_func=label)
+    e,m=markets[k]; st.caption('Retrieved UTC: '+stamp); st.write(label(k))
+    if provider=='Polymarket': st.write('Reported bid / ask:',m.get('bestBid'),m.get('bestAsk'))
+    else: st.write('Reported YES bid / ask:',m.get('yes_bid_dollars',m.get('yes_bid')),m.get('yes_ask_dollars',m.get('yes_ask')))
+    trade_research({provider:(e,[m],stamp)},{provider:k})
+
 def trade_research(snapshots, ids):
     import requests
     from datetime import datetime, timezone
@@ -268,17 +339,20 @@ def trade_research(snapshots, ids):
             trades=[]; cursor=None; seen=set()
             for _ in range(pages):
                 if provider=='Polymarket':
-                    url='https://data-api.polymarket.com/v2/trades'
-                    params={'condition':ident,'limit':500,'taker_only':'true'}
+                    url='https://data-api.polymarket.com/trades'
+                    params={'market':ident,'limit':500,'takerOnly':'true','offset':len(trades)}
                 else:
                     url='https://api.elections.kalshi.com/trade-api/v2/markets/trades'
                     params={'ticker':ident,'limit':500}
                 if cursor: params['cursor']=cursor
                 r=requests.get(url,params=params,timeout=20); r.raise_for_status(); payload=r.json()
-                batch=payload['data'] if provider=='Polymarket' else payload['trades']
+                batch=payload if provider=='Polymarket' else payload['trades']
                 if not isinstance(batch,list): raise ValueError('Unexpected trade response')
                 trades.extend(batch)
-                cursor=(payload.get('pagination') or {}).get('next_cursor') if provider=='Polymarket' else payload.get('cursor')
+                if provider=='Polymarket':
+                    if len(batch)<500: break
+                    continue
+                cursor=payload.get('cursor')
                 if not cursor: break
                 if cursor in seen: raise ValueError('Repeated pagination cursor')
                 seen.add(cursor)
@@ -299,7 +373,6 @@ def trade_research(snapshots, ids):
     if error: st.error(error); return
     if not rows: st.info('No public trades returned.'); return
     df=pd.DataFrame(rows).sort_values('timestamp_utc'); st.caption('Retrieved UTC: '+retrieved+' | Returned trades: '+str(len(df))+' (bounded sample; not necessarily complete history)')
-    st.dataframe(df,hide_index=True)
     st.download_button('Download trade CSV',df.to_csv(index=False),'public_trades.csv','text/csv')
     valid=df.dropna(subset=['timestamp_utc','yes_price'])
     if not valid.empty: st.line_chart(valid.set_index('timestamp_utc')['yes_price'])
@@ -310,7 +383,11 @@ def trade_research(snapshots, ids):
     st.write('Largest 10 reported fills')
     st.dataframe(df.dropna(subset=[value]).nlargest(10,value),hide_index=True)
     threshold=st.number_input('Large fill threshold (estimated USD)',min_value=1,value=1000,step=100)
-    st.write('Fills meeting threshold:',int((df[value]>=threshold).sum()))
+    large=df[df[value]>=threshold].sort_values('timestamp_utc',ascending=False)
+    st.metric('Large fills in retrieved sample',len(large))
+    st.dataframe(large[['timestamp_utc','outcome','reported_side','price',value]],hide_index=True)
+    with st.expander('All reported trades'):
+        st.dataframe(df,hide_index=True)
     timed=df.dropna(subset=['timestamp_utc']).copy()
     if not timed.empty:
         latest=timed.timestamp_utc.max()
@@ -328,12 +405,12 @@ def trade_research(snapshots, ids):
         else:
             before=valid[(valid.timestamp_utc<g)&(valid.timestamp_utc>=g-pd.Timedelta(minutes=5))]; after=valid[(valid.timestamp_utc>=g)&(valid.timestamp_utc<=g+pd.Timedelta(minutes=5))]
             st.write('Five-minute windows around supplied event time (descriptive only)')
-            st.dataframe(pd.DataFrame([{'window':n,'trades':len(d),'mean_yes_trade_price':d.yes_price.mean()} for n,d in [('Before',before),('After',after)]]),hide_index=True)
+            st.dataframe(pd.DataFrame([{'window':n,'trades':len(d),'mean_yes_trade_price':d.yes_price.mean(),'estimated_value_usd':d[value].sum(min_count=1),'large_fills':int((d[value]>=threshold).sum())} for n,d in [('Before',before),('After',after)]]),hide_index=True)
 
 def global_market():
     import os, requests
     from datetime import datetime, timezone
-    st.title('Global bookmaker research — V3.5')
+    st.title('Global bookmaker research — V3.6')
     st.caption('Read-only regional odds snapshots; coverage varies. No verified trading signals.')
     key=os.getenv('ODDS_API_KEY','')
     if not key:
@@ -380,6 +457,18 @@ def global_market():
     selected['raw_implied_probability']=1/pd.to_numeric(selected.decimal_odds,errors='coerce').where(lambda x:x>1)
     st.dataframe(selected,hide_index=True)
     st.download_button('Export full bookmaker snapshot',df.to_csv(index=False),'global_odds_snapshot.csv','text/csv')
+    totals=selected[selected.market=='totals'].copy()
+    if not totals.empty:
+        st.subheader('Goal totals — bookmaker consensus')
+        rows=[]
+        for (book,line),g in totals.groupby(['bookmaker_key','line']):
+            g=g.drop_duplicates('outcome'); odds=pd.to_numeric(g.decimal_odds,errors='coerce')
+            if set(g.outcome.str.lower())!={'over','under'} or not odds.gt(1).all() or not np.isfinite(odds).all(): continue
+            raw=1/odds
+            rows.append({'line':line,'book':str(g.bookmaker.iloc[0]).lower(),'over':float((raw/raw.sum())[g.outcome.str.lower()=='over'].iloc[0])})
+        if rows:
+            a=pd.DataFrame(rows).groupby(['line','book']).over.mean().reset_index().groupby('line').over.agg(['mean','count']).reset_index()
+            a['Over %']=100*a['mean']; a['Under %']=100-a['Over %']; st.dataframe(a[['line','Over %','Under %','count']],hide_index=True)
     global_comparison(selected)
     st.caption('Raw implied probabilities include bookmaker margin. Export snapshots for historical comparison; first observed price is not necessarily opening odds. No bookmaker stakes or money flow are supplied.')
 
