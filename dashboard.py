@@ -39,7 +39,7 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V4.3',layout='wide')
+    st.set_page_config(page_title='Football Intelligence V4.4',layout='wide')
     workspace=st.sidebar.radio('Workspace', ['Market intelligence','Market research','Global bookmakers','Historical backtest','Live intelligence lab'])
     if workspace=='Market intelligence':
         market_first()
@@ -53,7 +53,7 @@ def main():
     if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V4.3 — Historical backtest')
+    st.title('Football Intelligence V4.4 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -667,18 +667,117 @@ def soccer_series(x):
     if re.search(r'\b(soccer|association football)\b',tags+' '+title): return True
     return bool(re.match(r'^KX(?:MLS|EPL|UCL|UEL|UECL|LALIGA|LIGUE1|LIGUE2|BUNDESLIGA|SERIEA|SERIEB|BRASILEIRO|LIBERTADORES|SUDAMERICANA|CONCACAF|ITASUPERCUP|FACUP|EFLCUP|EREDIVISIE|LIGAMX|NWSL|WSL|COPAAMERICA|FIFAWORLDCUP|UEFANATIONS|SCOTTISHPREM|PRIMEIRALIGA)',t))
 
+def bookmaker_consensus44(df):
+    rows=[]
+    if df.empty: return pd.DataFrame()
+    for keys,g in df.groupby(['retrieved_utc','event_id','market','line','bookmaker_key'],dropna=False):
+        stamp,event,market,line,book=keys
+        g=g.drop_duplicates('outcome'); p=pd.to_numeric(g.decimal_odds,errors='coerce')
+        names=set(g.outcome.str.lower())
+        if market=='h2h': valid=len(g)==3 and 'draw' in names
+        elif market=='totals': valid=names=={'over','under'} and pd.notna(line)
+        else: continue
+        if not valid or not p.gt(1).all() or not np.isfinite(p).all(): continue
+        raw=1/p
+        for (_,r),v in zip(g.iterrows(),raw/raw.sum()):
+            rows.append(dict(retrieved_utc=stamp,event_id=event,fixture=r.fixture,league=r.league,market=market,line=line,outcome=r.outcome,bookmaker=r.bookmaker,bookmaker_key=book,probability=v,quote_updated_utc=r.quote_updated_utc))
+    return pd.DataFrame(rows)
+
+
+def bookmaker_scanner44(horizon):
+    import os, requests
+    st.subheader('Global bookmaker scanner')
+    st.caption('Pre-match quotes across regions. Bookmaker odds do not disclose customer stakes or money flow.')
+    key=os.getenv('ODDS_API_KEY','')
+    if not key:
+        try: key=st.secrets.get('ODDS_API_KEY','')
+        except Exception: pass
+    if not key: st.info('Existing ODDS_API_KEY required for bookmaker coverage.'); return
+    def fetch(path,params):
+        r=requests.get('https://api.the-odds-api.com/v4/'+path,params={**params,'apiKey':key},timeout=20)
+        if not r.ok: raise ValueError('Odds API HTTP '+str(r.status_code))
+        return r.json(),r.headers.get('x-requests-remaining'),r.headers.get('x-requests-last')
+    if st.button('Discover worldwide bookmaker leagues',key='bk44discover'):
+        try:
+            data,remaining,_=fetch('sports',{})
+            st.session_state['bk44leagues']={x['key']:x['title'] for x in data if x['key'].startswith('soccer_') and not x.get('has_outrights') and x.get('active',True)}
+            st.session_state['bk44remaining']=remaining
+        except Exception as e: st.error(str(e) if isinstance(e,ValueError) else 'League discovery failed.')
+    leagues=st.session_state.get('bk44leagues',{})
+    if not leagues: return
+    st.write('Active soccer leagues discovered:',len(leagues))
+    selected=st.multiselect('Leagues to scan (empty = all discovered)',list(leagues),format_func=leagues.get,key='bk44league') or list(leagues)
+    regions=st.multiselect('Bookmaker regions',['us','uk','eu','au','us2'],default=['eu','uk'],key='bk44regions')
+    markets=st.multiselect('Quote markets',['h2h','totals','spreads'],default=['h2h','totals'],key='bk44markets')
+    cap=st.selectbox('Maximum credits per scan',[8,16,24,40],key='bk44cap')
+    cost=len(regions)*len(markets); count=min(len(selected),cap//cost) if cost else 0
+    remaining=st.session_state.get('bk44remaining')
+    if remaining is not None:
+        try: count=min(count,int(remaining)//cost) if cost else 0
+        except ValueError: pass
+    st.caption(f'Next batch: up to {count} leagues; estimated maximum {count*cost} credits. Remaining: {remaining or "unknown"}. Manual refresh only.')
+    if st.button('Scan next bookmaker batch',disabled=count==0,key='bk44scan'):
+        now=pd.Timestamp.now(tz='UTC'); end=now+pd.Timedelta(hours=horizon); rows=[]; report=[]
+        offset=st.session_state.get('bk44offset',0)%len(selected); batch=(selected[offset:]+selected[:offset])[:count]
+        for league in batch:
+            try:
+                events,rem,used=fetch('sports/'+league+'/odds',{'regions':','.join(regions),'markets':','.join(markets),'oddsFormat':'decimal','commenceTimeFrom':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'commenceTimeTo':end.strftime('%Y-%m-%dT%H:%M:%SZ')})
+                st.session_state['bk44remaining']=rem
+                report.append(dict(league=league,events=len(events),credits=used,status='Returned'))
+                for e in events:
+                    kickoff=pd.to_datetime(e.get('commence_time'),utc=True,errors='coerce')
+                    if pd.isna(kickoff) or not now<kickoff<=end: continue
+                    for b in e.get('bookmakers',[]):
+                        for m in b.get('markets',[]):
+                            for o in m.get('outcomes',[]):
+                                rows.append(dict(retrieved_utc=now,event_id=e['id'],league=league,kickoff_utc=kickoff,fixture=e['home_team']+' vs '+e['away_team'],bookmaker=b['title'],bookmaker_key=b['key'],quote_updated_utc=m.get('last_update') or b.get('last_update'),market=m['key'],outcome=o['name'],line=o.get('point'),decimal_odds=o.get('price')))
+            except Exception as e:
+                report.append(dict(league=league,status=str(e) if isinstance(e,ValueError) else 'Request failed')); break
+        st.session_state['bk44offset']=offset+len(report)
+        st.session_state['bk44report']=report
+        if rows:
+            st.session_state['bk44history']=pd.concat([st.session_state.get('bk44history',pd.DataFrame()),pd.DataFrame(rows)],ignore_index=True).tail(150000)
+    if 'bk44report' in st.session_state: st.dataframe(pd.DataFrame(st.session_state['bk44report']),hide_index=True)
+    hist=st.session_state.get('bk44history',pd.DataFrame())
+    if hist.empty: return
+    now=pd.Timestamp.now(tz='UTC'); df=hist[(hist.kickoff_utc>now)&(hist.kickoff_utc<=now+pd.Timedelta(hours=horizon))].copy()
+    if df.empty: st.info('No retained upcoming quotes in this window.'); return
+    df=df.sort_values('retrieved_utc').drop_duplicates(['event_id','bookmaker_key','market','outcome','line'],keep='last')
+    st.write(f'{df.event_id.nunique()} fixtures · {df.league.nunique()} leagues · {df.bookmaker_key.nunique()} bookmaker identifiers')
+    st.dataframe(df.groupby(['bookmaker','bookmaker_key']).agg(fixtures=('event_id','nunique'),quotes=('outcome','size')).reset_index(),hide_index=True)
+    st.download_button('Export bookmaker snapshots',hist.to_csv(index=False),'bookmaker_history.csv',key='bk44export')
+    fixture=st.selectbox('Inspect bookmaker fixture',df.event_id.unique(),format_func=lambda i:df.loc[df.event_id==i,'fixture'].iloc[0],key='bk44fixture')
+    chosen=df[df.event_id==fixture]; st.dataframe(chosen[['bookmaker','market','line','outcome','decimal_odds','quote_updated_utc','retrieved_utc']],hide_index=True)
+    # Normalize only complete contemporaneous outcome sets, then keep latest per book and line.
+    q=bookmaker_consensus44(hist[hist.event_id==fixture]);
+    if not q.empty:
+        q['book_group']=q.bookmaker.str.lower().str.replace(r'[^a-z0-9]','',regex=True)
+        latest=q.sort_values('retrieved_utc').drop_duplicates(['bookmaker_key','market','line','outcome'],keep='last')
+        latest=latest.groupby(['market','line','outcome','book_group'],dropna=False).probability.mean().reset_index()
+        consensus=latest.groupby(['market','line','outcome'],dropna=False).probability.agg(['mean','count']).reset_index(); consensus['mean']*=100
+        st.caption('Margin-adjusted consensus; latest complete quote per bookmaker, asynchronous snapshots. Count = normalized bookmaker names.')
+        st.dataframe(consensus.rename(columns={'mean':'Consensus %','count':'Books'}),hide_index=True)
+        b=st.selectbox('Observed movement bookmaker',sorted(q.bookmaker_key.unique()),key='bk44move')
+        g=q[q.bookmaker_key==b].copy(); g['series']=g.market+' '+g.line.fillna('').astype(str)+' '+g.outcome
+        st.line_chart(g.pivot_table(index='retrieved_utc',columns='series',values='probability'))
+    st.caption('BTTS/team totals depend on provider event-level coverage and are not fetched by this batch. No direct Betfair, Matchbook or Smarkets integration; only returned bookmaker identifiers count as covered. Session history is temporary.')
+
+
 def market_first():
     import requests
     from concurrent.futures import ThreadPoolExecutor
-    st.title('Football Intelligence V4.3 — Global market scanner')
-    st.caption('Market-first research. Bounded public exchange coverage; no paid feed or live-score dependency.')
+    st.title('Football Intelligence V4.4 — Global market scanner')
+    st.caption('Market-first research. Global bookmaker and public exchange research; no new paid feed or live-score dependency.')
     def get(base,path,params):
         r=requests.get(base+path,params=params,timeout=15); r.raise_for_status(); return r.json()
     P='https://gamma-api.polymarket.com'; K='https://api.elections.kalshi.com/trade-api/v2'; D='https://data-api.polymarket.com'
     horizon=st.radio('Upcoming kickoff window (hours)',[24,48,72],horizontal=True,index=2)
+    bookmaker_scanner44(horizon)
+    st.divider()
+    st.subheader('Exchange market scanner — Kalshi and Polymarket')
     q=st.text_input('Optional team / fixture filter')
     budget=st.selectbox('Kalshi series per scan',[12,30,60],index=1)
-    if st.button('Scan global football markets',type='primary') or 'current42' not in st.session_state:
+    if st.button('Scan global football markets',type='primary'):
         rows=[]; errors=[]; now=pd.Timestamp.now(tz='UTC'); events=[]
         with st.spinner('Discovering football series and markets…'):
             try:
