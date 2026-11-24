@@ -39,11 +39,15 @@ def evaluate(df,start,end):
     return pd.DataFrame(rows)
 
 def main():
-    st.set_page_config(page_title='Football Intelligence V3.3.1',layout='wide')
-    if st.sidebar.radio('Workspace', ['Historical backtest','Market research']) == 'Market research':
+    st.set_page_config(page_title='Football Intelligence V3.4',layout='wide')
+    workspace=st.sidebar.radio('Workspace', ['Historical backtest','Market research','Global bookmakers'])
+    if workspace=='Global bookmakers':
+        global_market()
+        return
+    if workspace=='Market research':
         market_research()
         return
-    st.title('Football Intelligence V3.3.1 — Historical backtest')
+    st.title('Football Intelligence V3.4 — Historical backtest')
     st.caption('Historical research • 10 European leagues • No live trading or verified profitable signals')
     with st.sidebar:
         start=pd.Timestamp(st.date_input('Test start',pd.Timestamp('2026-08-24'))); end=pd.Timestamp(st.date_input('Test end',pd.Timestamp('2026-11-22')))
@@ -84,7 +88,7 @@ def market_research():
     import requests, json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
-    st.title('Market research — V3.3.1')
+    st.title('Market research — V3.4')
     st.caption('Read-only provider data. Quotes may be delayed; no validated trading signals.')
     def get(url, params):
         r=requests.get(url,params=params,timeout=20); r.raise_for_status(); return r.json()
@@ -326,4 +330,54 @@ def trade_research(snapshots, ids):
             st.write('Five-minute windows around supplied event time (descriptive only)')
             st.dataframe(pd.DataFrame([{'window':n,'trades':len(d),'mean_yes_trade_price':d.yes_price.mean()} for n,d in [('Before',before),('After',after)]]),hide_index=True)
 
+def global_market():
+    import os, requests
+    from datetime import datetime, timezone
+    st.title('Global bookmaker research — V3.4')
+    st.caption('Read-only regional odds snapshots; coverage varies. No verified trading signals.')
+    key=os.getenv('ODDS_API_KEY','')
+    if not key:
+        try: key=st.secrets.get('ODDS_API_KEY','')
+        except Exception: pass
+    if not key:
+        st.info('Add ODDS_API_KEY in Streamlit app secrets to enable this workspace.')
+        return
+    def fetch(path,params=None):
+        r=requests.get('https://api.the-odds-api.com/v4/'+path,params={**(params or {}),'apiKey':key},timeout=25)
+        if not r.ok: raise ValueError(f'Odds provider HTTP {r.status_code}; check key, coverage or quota.')
+        return r.json(),r.headers.get('x-requests-remaining','Unknown')
+    if st.button('Discover football leagues'):
+        try:
+            data,_=fetch('sports'); st.session_state['global_leagues']={x['key']:x['title'] for x in data if x['key'].startswith('soccer_') and not x.get('has_outrights')}
+        except Exception as e: st.error(str(e))
+    leagues=st.session_state.get('global_leagues',{})
+    if not leagues: return
+    league=st.selectbox('Football league',list(leagues),format_func=leagues.get)
+    regions=st.multiselect('Bookmaker regions',['us','us2','uk','eu','au'],default=['us','uk','eu','au'])
+    markets=st.multiselect('Markets',['h2h','totals','spreads'],default=['h2h','totals'])
+    st.caption(f'Maximum requested credits: {len(regions)*len(markets)} per snapshot. Regional labels refer to bookmakers, not match locations.')
+    if st.button('Retrieve bookmaker snapshot',disabled=not regions or not markets):
+        try:
+            events,remaining=fetch(f'sports/{league}/odds',{'regions':','.join(regions),'markets':','.join(markets),'oddsFormat':'decimal'})
+            now=datetime.now(timezone.utc).isoformat(); rows=[]
+            for event in events:
+                for book in event.get('bookmakers',[]):
+                    for market in book.get('markets',[]):
+                        for outcome in market.get('outcomes',[]):
+                            rows.append(dict(retrieved_utc=now,event_id=event['id'],league=league,kickoff_utc=event.get('commence_time'),fixture=event['home_team']+' vs '+event['away_team'],bookmaker=book['title'],bookmaker_key=book['key'],quote_updated_utc=market.get('last_update') or book.get('last_update'),market=market['key'],outcome=outcome['name'],line=outcome.get('point'),decimal_odds=outcome.get('price')))
+            st.session_state['global_current']=pd.DataFrame(rows); st.session_state['global_remaining']=remaining
+        except Exception as e: st.error(str(e) if isinstance(e,ValueError) else 'Provider request failed; retry later.')
+    df=st.session_state.get('global_current')
+    if df is None: return
+    st.write('Remaining API credits:',st.session_state['global_remaining'])
+    if df.empty: st.info('No bookmaker quotes returned.'); return
+    st.write('Snapshot league:',df.league.iloc[0]); st.write('Bookmakers returned:',df.bookmaker_key.nunique())
+    fixture=st.selectbox('Fixture',df.fixture.unique()); selected=df[df.fixture==fixture].copy()
+    selected['raw_implied_probability']=1/pd.to_numeric(selected.decimal_odds,errors='coerce').where(lambda x:x>1)
+    st.dataframe(selected,hide_index=True)
+    st.download_button('Export full bookmaker snapshot',df.to_csv(index=False),'global_odds_snapshot.csv','text/csv')
+    st.caption('Raw implied probabilities include bookmaker margin. Export snapshots for historical comparison; first observed price is not necessarily opening odds. No bookmaker stakes or money flow are supplied.')
+
+
 if __name__=='__main__': main()
+
